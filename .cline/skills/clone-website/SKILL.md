@@ -57,6 +57,7 @@ Routing defaults:
 5. Write an output plan listing every target URL, `<app-root>`, `<site-key>`, `<page-key>`, destination route, artifact roots, and whether any shared foundation file must change. Resolve collisions across every planned output, same-path query/fragment behavior, and multi-origin layout decisions with the user before editing.
 6. Create only the planned per-page/per-site directories plus `scripts/` if needed. Use unique asset-download script names such as `scripts/download-assets-<site-key>-<page-key>.mjs`; do not overwrite another page's downloader.
 7. For multiple pages from one origin, build the shared foundation once, sequentially, before parallel page work. Optionally confirm whether to run page builders in parallel (recommended if resources allow) or sequentially to avoid overload.
+8. **Install the local capture and diff harness.** Browser MCP is for interactive probing; it generally cannot save a file to disk or capture below the fold, and it cannot compare two images. Install `playwright` (plus `npx playwright install chromium`) for persisted full-page screenshots, and `pixelmatch` with `pngjs` for the Phase 5 numeric diff. Add all three as devDependencies and tell the user you added them.
 
 ## Guiding Principles
 
@@ -148,9 +149,55 @@ Every builder agent must verify `npx tsc --noEmit` passes before finishing. Afte
 Navigate to the target URL with browser MCP.
 
 ### Screenshots
-- Take **full-page screenshots** at desktop (1440px) and mobile (390px) viewports
+- Take **full-page screenshots** at desktop (1440px), tablet (768px), and mobile (390px) viewports
 - Save to that page's screenshot root (`docs/design-references/<site-key>/<page-key>/`) with descriptive names
 - These are your master reference — builders will receive section-specific crops/screenshots later
+
+Most browser MCP tools return an image into the conversation but cannot write a file to disk, and
+many cannot capture beyond the viewport. Use the local Playwright harness from Pre-Flight for the
+master references so they persist as artifacts builders and the QA pass can actually open:
+
+```javascript
+// scripts/shoot-<site-key>-<page-key>.mjs
+import { chromium } from 'playwright';
+import { mkdirSync } from 'fs';
+
+const OUT = 'docs/design-references/<site-key>/<page-key>';
+const url = process.argv[2];
+const tag = process.argv[3];            // 'original' or 'clone'
+const viewports = [
+  { name: 'desktop-1440', width: 1440, height: 900 },
+  { name: 'tablet-768', width: 768, height: 1024 },
+  { name: 'mobile-390', width: 390, height: 844 },
+];
+
+mkdirSync(OUT, { recursive: true });
+const browser = await chromium.launch();
+for (const vp of viewports) {
+  const ctx = await browser.newContext({ viewport: { width: vp.width, height: vp.height }, deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
+  // CRITICAL: scroll the whole page first, or every scroll-reveal element
+  // screenshots at opacity 0 and the reference is useless
+  await page.evaluate(async () => {
+    const step = Math.round(window.innerHeight * 0.7);
+    for (let y = 0; y < document.body.scrollHeight; y += step) {
+      window.scrollTo(0, y);
+      await new Promise(r => setTimeout(r, 220));
+    }
+    window.scrollTo(0, 0);
+    await new Promise(r => setTimeout(r, 600));
+  });
+  await page.waitForTimeout(1200);
+  await page.screenshot({ path: `${OUT}/${tag}-${vp.name}-full.png`, fullPage: true });
+  await page.screenshot({ path: `${OUT}/${tag}-${vp.name}-hero.png` });
+  await ctx.close();
+}
+await browser.close();
+```
+
+Run it once against the live URL with tag `original` now, and again against the local clone with tag
+`clone` in Phase 5. Keep browser MCP for interactive probing, where it is the better tool.
 
 ### Global Extraction
 Extract these from the page before doing anything else:
@@ -162,6 +209,58 @@ Extract these from the page before doing anything else:
 **Favicons & Meta** — Download page/site SEO assets under the planned site asset namespace. Put truly app-global metadata in the root layout only when it applies to every route; otherwise export route-specific metadata from the destination page or a route layout.
 
 **Global UI patterns** — Identify any site-wide CSS or JS: custom scrollbar hiding, scroll-snap on the page container, global keyframe animations, backdrop filters, gradients used as overlays, **smooth scroll libraries** (Lenis, Locomotive Scroll — check for `.lenis`, `.locomotive-scroll`, or custom scroll container classes). Merge truly shared behavior into `globals.css`; keep page-specific behavior scoped to the page so existing routes do not change unexpectedly.
+
+### Read the Shipped Source
+
+Do this BEFORE the interaction sweep. Every site ships its own stylesheets and JavaScript, and they
+are readable. Reading them turns guesswork into transcription: instead of probing until a threshold
+looks about right, you read the number. Probing tells you a header hides "somewhere around 100px";
+the source tells you it hides at `scrollY > 100` and returns after 50px of *accumulated* upward
+scroll, which no amount of scrolling would have revealed.
+
+1. **Enumerate the bundles.** Read the asset URLs from the live DOM rather than from a `curl` of the
+   HTML, since a server-rendered page often lists different files than the hydrated one:
+
+   ```javascript
+   JSON.stringify({
+     css: [...document.querySelectorAll('link[rel=stylesheet]')].map(l => new URL(l.href).pathname),
+     js: [...document.querySelectorAll('link[rel=modulepreload], script[src]')]
+           .map(e => new URL(e.href || e.src).pathname)
+   })
+   ```
+
+2. **Download them** into your scratchpad, not into the project.
+
+3. **Mine the CSS first.** It is small and dense with exact values:
+   - `@theme`, `:root`, or `@layer theme` blocks give the whole design token set (colors, font
+     families, type scale, radii, spacing) in one read. Compare each token against your project's
+     defaults and override only what actually differs.
+   - `@font-face` blocks give real font file URLs, weights, and `font-display`.
+   - `@keyframes` blocks give every animation verbatim, including durations and easing.
+   - Custom utility classes explain any class name you could not account for.
+
+4. **Mine the JS for behavior.** Grep the downloaded chunks for a distinctive class string you saw
+   toggle during the sweep, then read the surrounding code:
+
+   ```bash
+   grep -l "translate-y-full" js/*        # find the chunk that owns the header
+   ```
+
+   Minified code is still readable when you only need the constants and the control flow. Extract:
+   scroll thresholds and their comparison operators, `setInterval` / `setTimeout` durations,
+   `IntersectionObserver` thresholds and `rootMargin`, easing formulas, stagger delays, and the exact
+   condition behind each state class. Transcribe the logic into your `BEHAVIORS.md` as pseudocode so
+   builders implement the rule rather than reverse-engineering it from symptoms.
+
+5. **Check whether the target uses your styling toolkit.** If the DOM is full of Tailwind class
+   strings, the markup *is* the style spec. Save each section's comment-stripped `outerHTML` to
+   `docs/research/<site-key>/<page-key>/markup/<NN>-<section>.html` and have builders port those
+   class strings verbatim instead of re-deriving spacing from `getComputedStyle`. This is faster and
+   strictly more accurate. Note that stateful markup needs one capture per state (header at rest and
+   scrolled, menu open and closed).
+
+Reading the source never replaces the interaction sweep. The sweep tells you *which* behaviors exist
+and which are worth chasing; the source tells you their exact parameters. Do both.
 
 ### Mandatory Interaction Sweep
 
@@ -463,17 +562,88 @@ After all sections are built and merged, wire the page into the exact destinatio
 
 ## Phase 5: Visual QA Diff
 
-After assembly, do NOT declare the clone complete. Take side-by-side comparison screenshots:
+After assembly, do NOT declare the clone complete. Measure the difference, do not eyeball it. Eyes
+miss a 4px padding error and waste attention on photo compression noise; the two checks below invert
+that. Run them at 1440px, 768px, and 390px.
 
-1. Open the original site and the clone at its planned local route side-by-side (or take screenshots at the same viewport widths)
-2. Compare section by section, top to bottom, at desktop (1440px)
-3. Compare again at mobile (390px)
-4. For each discrepancy found:
-   - Check the component spec file — was the value extracted correctly?
-   - If the spec was wrong: re-extract from browser MCP, update the spec, fix the component
+### 5a. Layout alignment (run this first)
+
+The cheapest and highest-signal check. Measure the vertical position of a marker in every section on
+both sites and diff the numbers. A single mismatch localizes the fault to one section instantly,
+and identical totals prove the whole page is aligned.
+
+```javascript
+// run in each page via Playwright, after scrolling the page to fire scroll reveals
+const MARKERS = ['About us', 'Our services', /* one distinctive string per section */];
+await page.evaluate((markers) => {
+  const res = {};
+  for (const m of markers) {
+    const el = [...document.querySelectorAll('h1,h2,h3,p,span,a')]
+      .find(e => (e.textContent || '').trim().startsWith(m));
+    res[m] = el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : null;
+  }
+  res.__docHeight = document.documentElement.scrollHeight;
+  return res;
+}, MARKERS);
+```
+
+Print `original`, `clone`, and `delta` per marker. Every delta should be `0`; treat 1px as
+sub-pixel rounding. **Read the deltas top to bottom and fix the first non-zero one before looking at
+the rest**, since one wrong margin shifts everything below it and inflates the whole list.
+
+A delta that appears only at the first section carrying a `margin-top` usually means a margin
+collapsed in one version and not the other. Compare how the source roots its sections: a wrapper
+that is `display: contents` or a flex container makes every section a flex item, and flex items
+never collapse margins.
+
+### 5b. Automated pixel diff
+
+Screenshot both pages into aligned bands, then diff them numerically.
+
+```bash
+npm i -D pixelmatch pngjs
+```
+
+```javascript
+// scripts/pixeldiff-<site-key>-<page-key>.mjs
+import pixelmatch from 'pixelmatch';
+import { PNG } from 'pngjs';
+import { readFileSync, writeFileSync } from 'fs';
+
+const a = PNG.sync.read(readFileSync(`${DIR}/${band}-original.png`));
+const b = PNG.sync.read(readFileSync(`${DIR}/${band}-clone.png`));
+const diff = new PNG({ width: a.width, height: a.height });
+const n = pixelmatch(a.data, b.data, diff.data, a.width, a.height, { threshold: 0.12 });
+const pct = (n / (a.width * a.height)) * 100;
+if (pct > 0.5) writeFileSync(`${DIR}/${band}-DIFF.png`, PNG.sync.write(diff));
+```
+
+Capture the bands with Playwright using `fullPage: true` plus a `clip` of
+`{ x: 0, y: i * 900, width, height: 900 }`, one file per band per target.
+
+Reading the numbers:
+- **Under ~0.5%**: anti-aliasing and image encoding noise. Ignore.
+- **0.5% to a few percent**: open the written `-DIFF.png`. Red confined to the inside of a photo is
+  encoder noise or an animation caught mid-cycle, both acceptable. Red on text, edges, borders, or
+  buttons is a real defect.
+- **Uniform red over a whole text block** that measures correct in 5a is a 1px shift, not a
+  restyle. Confirm with 5a before touching any CSS.
+- **A band that is red everywhere**: usually a slideshow or video on a different frame. Confirm by
+  checking which asset each side is displaying before assuming a bug.
+
+Only open a diff image when the number says something is wrong. That is the point of measuring.
+
+### 5c. Fix and re-verify
+
+1. For each real discrepancy, check the component spec file: was the value extracted correctly?
+   - If the spec was wrong: re-extract, update the spec, then fix the component
    - If the spec was right but the builder got it wrong: fix the component to match the spec
-5. Test all interactive behaviors: scroll through the page, click every button/tab, hover over interactive elements
-6. Verify smooth scroll feels right, header transitions work, tab switching works, animations play
+2. Re-run 5a and 5b after every fix.
+3. Test all interactive behaviors: scroll through the page, click every button/tab, hover over
+   interactive elements. Script this too, asserting the exact values from `BEHAVIORS.md`, for
+   example that the header carries `-translate-y-full` past its threshold and that a counter lands
+   on its real final value.
+4. Verify smooth scroll feels right, header transitions work, tab switching works, animations play.
 
 Only after this visual QA pass is the clone complete.
 
